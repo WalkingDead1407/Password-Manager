@@ -1,348 +1,344 @@
 import mysql.connector
 import pyotp
+import math
+import string
 import time
-# Database configuration
-host = 'localhost'
-user = 'root'
-password = 'tiger'
-port = 3306
+import re
+
+
+DB_HOST = 'localhost'
+DB_USER = 'root'
+DB_PASS = 'tiger'
+DB_PORT = 3306
+
+PW_DB = 'password_manager'
+TWOFA_DB = 'user_2fa'  
+
+
+
+#Entropy
+def get_charset_size(password: str) -> int:
+    size = 0
+    if any(c.islower() for c in password):
+        size += 26
+    if any(c.isupper() for c in password):
+        size += 26
+    if any(c.isdigit() for c in password):
+        size += 10
+    if any(c in string.punctuation for c in password):
+        size += len(string.punctuation)
+    if any(ord(c) > 127 for c in password):
+        size += 100
+    return size
+
+def calculate_entropy(password: str) -> float:
+    charset_size = get_charset_size(password)
+    if charset_size == 0:
+        return 0.0
+    return len(password) * math.log2(charset_size)
+
+COMMON = {
+    "password", "123456", "qwerty", "admin", "abc123",
+    "letmein", "welcome", "pass@123", "iloveyou"
+}
+
+def is_common(password: str) -> bool:
+    return password.lower() in COMMON
+
+def strength_rating(entropy: float, password: str) -> str:
+    if is_common(password):
+        return "Very Weak (Common Password)"
+    if entropy < 28:
+        return "Weak"
+    elif entropy < 36:
+        return "Moderate"
+    elif entropy < 60:
+        return "Strong"
+    else:
+        return "Very Strong"
+
+def analyze_password(password: str) -> dict:
+    entropy = calculate_entropy(password)
+    rating = strength_rating(entropy, password)
+    return {"entropy": round(entropy, 2), "rating": rating}
+
 
 def connect_to_database():
     conn = mysql.connector.connect(
-        host=host,
-        user=user,
-        password=password,
-        port=port
+        host=DB_HOST,
+        user=DB_USER,
+        password=DB_PASS,
+        port=DB_PORT
     )
     cursor = conn.cursor()
     return conn, cursor
 
-def create_database_and_tables(cursor): 
-    database_name = 'password_manager'
-    cursor.execute(f"CREATE DATABASE IF NOT EXISTS {database_name}")
-    cursor.execute(f"USE {database_name}")
-    
+def create_database_and_tables(cursor):
+    cursor.execute(f"CREATE DATABASE IF NOT EXISTS {PW_DB}")
+    cursor.execute(f"USE {PW_DB}")
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INT AUTO_INCREMENT PRIMARY KEY,
             username VARCHAR(50) UNIQUE,
-            pin VARCHAR(4)  
+            pin CHAR(4)
         )
     ''')
-    
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS passwords (
             id INT AUTO_INCREMENT PRIMARY KEY,
             user_id INT,
-            website VARCHAR(100),
-            password VARCHAR(100),
-            FOREIGN KEY (user_id) REFERENCES users(id)
+            website VARCHAR(200),
+            password VARCHAR(200),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         )
     ''')
 
-def verify_otp(cursor):
-    global username_input
-    global pin_input
-    otp_input = input("Enter your OTP code: ")
 
-    try:
-        cursor.execute("SELECT pin, key FROM twofa WHERE username = %s", (username_input,))
-        result = cursor.fetchone()
+def fetch_2fa_row(cursor_2fa, username: str):
+    cursor_2fa.execute(
+        "SELECT pin, secret_key FROM user_2fa.twofa WHERE username = %s",
+        (username,)
+    )
+    return cursor_2fa.fetchone()
 
-        if result is None:
-            print("Username not found.")
-            return False
+def verify_otp_for_user(cursor_2fa, username: str, pin_input: str) -> bool:
+    row = fetch_2fa_row(cursor_2fa, username)
+    if not row:
+        print("2FA record not found for this username. Register in the 2FA app first.")
+        return False
 
-        stored_pin, secret_key = result
+    stored_pin, secret_key = row
 
-        if pin_input != stored_pin:
-            print("Incorrect PIN.")
-            return False
+    if stored_pin != pin_input:
+        print("Incorrect 2FA PIN.")
+        return False
 
-        totp = pyotp.TOTP(secret_key, digits=4)
-        if totp.verify(otp_input):
-            print("✅ OTP verified successfully!")
-            return True
-        else:
-            print("❌ Invalid OTP. Please try again.")
-            return False
-        
-    except mysql.connector.Error as err:
-        print(f"Database error: {err}")
+    otp_input = input("Enter your OTP code: ").strip()
 
+    totp = pyotp.TOTP(secret_key, digits=4)
+
+    if totp.verify(otp_input):
+        print("✅ OTP verified successfully!")
+        return True
+    else:
+        print("❌ Invalid OTP.")
+        return False
+
+
+def valid_pin(pin: str) -> bool:
+    return bool(re.fullmatch(r'\d{4}', pin))
 
 def store_user(cursor, conn):
-    """Prompt for user information and store it in the database."""
-    global username_input
-    global pin_input
-    username_input = input("Enter the username: ")
-    print("****PLEASE MAKE YOUR USER IN OUR OTP APP TO CONTINUE****")
-    
-    try:
-        # Insert the new user
-        cursor.execute('INSERT INTO users (username) VALUES (%s)', (username_input,))
-        conn.commit() 
-        print("User added successfully.")
-        redirecting_animation()
+    username = input("Enter the username: ").strip()
+    if not username:
+        print("Username cannot be empty.")
+        return
 
+    pin = input("Set a 4-digit PIN for this user: ").strip()
+    if not valid_pin(pin):
+        print("PIN must be 4 digits.")
+        return
+
+    try:
+        cursor.execute('INSERT INTO users (username, pin) VALUES (%s, %s)', (username, pin))
+        conn.commit()
+        print("User added successfully.")
     except mysql.connector.Error as err:
-        print(f"Error: {err}")
+        print("Error adding user:", err)
 
 def store_password(cursor, conn):
-    global username_input
-    username_input = input("Enter the username for the password: ")
-    website = input("Enter the website: ")
-    password_input = input("Enter the password: ")
-    
-    cursor.execute('SELECT id FROM users WHERE username = %s', (username_input,))
+    username = input("Enter the username: ").strip()
+    website = input("Enter website: ").strip()
+    password_input = input("Enter the password: ").strip()
+
+    cursor.execute('SELECT id FROM users WHERE username = %s', (username,))
     user = cursor.fetchone()
-    
+
     if user:
         user_id = user[0]
-        cursor.execute('INSERT INTO passwords (user_id, website, password) VALUES (%s, %s, %s)', 
-                       (user_id, website, password_input))
+        cursor.execute(
+            'INSERT INTO passwords (user_id, website, password) VALUES (%s, %s, %s)',
+            (user_id, website, password_input)
+        )
         conn.commit()
-        print("Password record inserted successfully.")
-        redirecting_animation()
+        print("Password stored.")
     else:
-        print("User not found. Please add the user first.")
-        redirecting_animation()
-        main()
+        print("User not found.")
 
-        
-def view_password(cursor):
-    global username_input
-    global pin_input
+def view_password(cursor, conn):
+    username = input("Enter your username: ").strip()
 
-    website_to_view = input("Enter the website for which you want to view the password: ")
-
-    # Fetch user data
-    cursor.execute('SELECT id, pin FROM users WHERE username = %s', (username_input,))
+    cursor.execute('SELECT id, pin FROM users WHERE username = %s', (username,))
     user = cursor.fetchone()
 
-    if user:
-        user_id = user
-        verify_otp(cursor)  # This uses global username_input and pin_input
-        if not verify_otp(cursor):
-            print("OTP verification failed.")
-            redirecting_animation()
+    if not user:
+        print("User not found.")
+        return
+
+    user_id, stored_pin = user
+    pin_input = input("Enter your 4-digit PIN: ").strip()
+
+    if stored_pin != pin_input:
+        print("Incorrect PIN.")
+        return
+
+    # OTP verify
+    conn2, cursor2 = connect_to_database()
+    try:
+        if not verify_otp_for_user(cursor2, username, pin_input):
             return
+    finally:
+        cursor2.close()
+        conn2.close()
 
-        # If OTP is verified, fetch password
-        cursor.execute('SELECT password FROM passwords WHERE user_id = %s AND website = %s', 
-                       (user_id, website_to_view))
-        result = cursor.fetchone()
+    website = input("Enter the website to view password: ").strip()
 
-        if result:
-            print(f"Password for {username_input} on {website_to_view} is: {result[0]}")
-        else:
-            print("No records found for the specified username and website.")
+    cursor.execute(
+        'SELECT password FROM passwords WHERE user_id = %s AND website = %s',
+        (user_id, website)
+    )
+    result = cursor.fetchone()
 
+    if result:
+        print(f"Password for {username} at {website}: {result[0]}")
     else:
-        print("User not found.")
-        
-    redirecting_animation()
+        print("No password found.")
 
-        
 def update_password(cursor, conn):
-    global username_input,pin
-    username_input = input("Enter your username for the website: ")
-    website_to_update = input("Enter the website for which you want to update the password: ")
-    pin_input = input("Enter your 4-digit PIN: ")
-    new_password = input("Enter the new password: ")
-    
-    cursor.execute('SELECT id, pin FROM users WHERE username = %s', (username_input,))
+    username = input("Enter your username: ").strip()
+    cursor.execute('SELECT id, pin FROM users WHERE username = %s', (username,))
     user = cursor.fetchone()
-    
-    if user:
-        user_id, stored_pin = user
-        if stored_pin == pin_input:
-            cursor.execute('UPDATE passwords SET password = %s WHERE user_id = %s AND website = %s',
-                           (new_password, user_id, website_to_update))
-            conn.commit()
-            
-            if cursor.rowcount > 0:
-                print("Password updated successfully.")
-                redirecting_animation()
 
-            else:
-                print("No records found to update.")
-                redirecting_animation()
-
-        else:
-            print("Incorrect PIN.")
-            print("Exiting the programme")
-            redirecting_animation()
-
-    else:
+    if not user:
         print("User not found.")
-        redirecting_animation()
+        return
+
+    user_id, stored_pin = user
+    pin_input = input("Enter your PIN: ").strip()
+
+    if stored_pin != pin_input:
+        print("Incorrect PIN.")
+        return
+
+    website = input("Website to update: ").strip()
+    new_pw = input("New password: ").strip()
+
+    cursor.execute(
+        'UPDATE passwords SET password = %s WHERE user_id = %s AND website = %s',
+        (new_pw, user_id, website)
+    )
+    conn.commit()
+
+    if cursor.rowcount:
+        print("Password updated.")
+    else:
+        print("No matching record.")
 
 def delete_password(cursor, conn):
-    global username_input
-    global pin_input
-    username_input = input("Enter your username for the website: ")
-    website_to_delete = input("Enter the website for which you want to delete the password: ")
-    pin_input = input("Enter your 4-digit PIN: ")
-    
-    cursor.execute('SELECT id, pin FROM users WHERE username = %s', (username_input,))
+    username = input("Enter your username: ").strip()
+    cursor.execute('SELECT id, pin FROM users WHERE username = %s', (username,))
     user = cursor.fetchone()
-    
-    if user:
-        user_id, stored_pin = user
-        if stored_pin == pin_input:
-            cursor.execute('DELETE FROM passwords WHERE user_id = %s AND website = %s', (user_id, website_to_delete))
-            conn.commit()
-            
-            if cursor.rowcount > 0:
-                print("Password deleted successfully.")
-            else:
-                print("No records found to delete.")
-        else:
-            print("Incorrect PIN.")
-    else:
-        print("User not found.")
 
-def admin(cursor):  # Pass cursor as parameter
-    u = input("Enter your username: ")
-    if u == "admin":
-        admp = input("Enter your password: ")
-        if admp == "admin123":
-            ad2fa = int(input("Enter your 2FA: "))
-            if ad2fa == 1111:
-                a = input("What task would you like to perform: \n1. Analyze password strengths\n2. Access logs\n3. Visualize passwords\n")
-                if a == "1":
-                    psc(cursor)
-                # Add other options here
+    if not user:
+        print("User not found.")
+        return
+
+    user_id, stored_pin = user
+    pin_input = input("Enter your PIN: ").strip()
+
+    if stored_pin != pin_input:
+        print("Incorrect PIN.")
+        return
+
+    website = input("Website to delete: ").strip()
+
+    cursor.execute(
+        'DELETE FROM passwords WHERE user_id = %s AND website = %s',
+        (user_id, website)
+    )
+    conn.commit()
+
+    if cursor.rowcount:
+        print("Password deleted.")
+    else:
+        print("No record found.")
 
 def psc(cursor):
-    special = "!@#$%^&*()-_=+[{]}\\|;:'\",<.>/?`~"
+    username = input("Enter your username: ").strip()
+
+    cursor.execute('SELECT id FROM users WHERE username = %s', (username,))
+    user = cursor.fetchone()
+
+    if not user:
+        print("User not found.")
+        return
+
+    user_id = user[0]
+
+    pin_input = input("Enter your 4-digit PIN: ").strip()
+
+    conn2, cursor2 = connect_to_database()
     try:
-        username_view = input("Enter your username for the website: ")
-        website_to_view = input("Enter the website for which you want to view the password: ")
-        pin_input = input("Enter your 4-digit PIN: ")
-        
-        cursor.execute('SELECT id, pin FROM users WHERE username = %s', (username_view,))
-        user = cursor.fetchone()
-        
-        if user:
-            user_id, stored_pin = user
-            if stored_pin == pin_input:
-                cursor.execute('SELECT password FROM passwords WHERE user_id = %s AND website = %s', 
-                               (user_id, website_to_view))
-                result = cursor.fetchone()
-                if result:
-                    password = result[0]
-                    length_score = 2.0 if len(password) >= 8 else 0
-                    c1 = c2 = c3 = c4 = 0
-                    
-                    for char in password:
-                        if char.isupper():
-                            c1 += 1
-                        elif char.islower():
-                            c2 += 1
-                        elif char.isdigit():
-                            c3 += 1
-                        elif char in special:
-                            c4 += 1
-                    
-                    score = (c1 > 0)*2.0 + (c2 > 0)*2.0 + (c3 > 0)*2.0 + (c4 > 0)*2.0 + length_score
-                    print(f"Password strength score (max 10): {score}")
-                    
-                    # Provide feedback
-                    if score >= 8:
-                        print("This is a strong password!")
-                        redirecting_animation()
+        if not verify_otp_for_user(cursor2, username, pin_input):
+            return
+    finally:
+        cursor2.close()
+        conn2.close()
 
-                    elif score >= 5:
-                        print("This password could be stronger.")
-                        redirecting_animation()
+    website = input("Enter website: ").strip()
 
-                    else:
-                        print("This is a weak password. Consider changing it.")
-                        redirecting_animation()
+    cursor.execute(
+        'SELECT password FROM passwords WHERE user_id = %s AND website = %s',
+        (user_id, website)
+    )
+    row = cursor.fetchone()
 
-                else:
-                    print("No records found for the specified username and website.")
-                    redirecting_animation()
+    if not row:
+        print("No password found.")
+        return
 
-            else:
-                print("Incorrect PIN.")
-                redirecting_animation()
+    password = row[0]
+    analysis = analyze_password(password)
 
-        else:
-            print("User not found.")
-            redirecting_animation()
+    print("\n=== Password Strength Analysis ===")
+    print(f"Password: {password}")
+    print(f"Entropy: {analysis['entropy']} bits")
+    print(f"Strength: {analysis['rating']}")
 
-    except mysql.connector.Error as err:
-        print(f"Error: {err}")
 
-def redirecting_animation(cycles=4):
-    states = [
-        "redirecting   ",
-        "redirecting.  ",
-        "redirecting.. ",
-        "redirecting...",
-        "redirecting.. ",
-        "redirecting.  ",
-    ]
-
-    for _ in range(cycles):
-        for state in states:
-            print(f"\r{state}", end="")
-            for _ in range(10000000):
-                pass
-
-    
 
 def main():
     conn, cursor = connect_to_database()
     create_database_and_tables(cursor)
-    print("Password Manager".center(100))
+
+    print("Password Manager".center(60))
 
     while True:
-        print("\n1. Add user\n2. Add password\n3. View password\n4. Update password\n5. Delete password\n6. View Password Strength\n7. Admin \n8. Exit")
-        print("***If you haven't created a user yet MAKE SURE TO DO SO***")
-        choice = input("\nChoose an option: ")
-        
+        print("\n1. Add user\n2. Add password\n3. View password\n4. Update password\n5. Delete password\n6. View strength\n7. Exit")
+        choice = input("Choose: ").strip()
+
         if choice == "1":
             store_user(cursor, conn)
-            redirecting_animation()
         elif choice == "2":
             store_password(cursor, conn)
         elif choice == "3":
-            view_password(cursor)
+            view_password(cursor, conn)
         elif choice == "4":
             update_password(cursor, conn)
         elif choice == "5":
             delete_password(cursor, conn)
         elif choice == "6":
-            admin(cursor)
+            psc(cursor)
         elif choice == "7":
-            states = [
-        "Exiting the program   ",
-        "Exiting the program.  ",
-        "Exiting the program.. ",
-        "Exiting the program...",
-        "Exiting the program.. ",
-        "Exiting the program.  ",
-        ]
-
-            for _ in range(4):
-                for state in states:
-                    print(f"\r{state}", end="")
-                for _ in range(1000):
-                    pass
-
+            print("Exiting...")
             break
         else:
-            print("Invalid input! Please try again.")
+            print("Invalid input.")
 
     cursor.close()
     conn.close()
 
-
-username_input=""
 if __name__ == "__main__":
     main()
-
