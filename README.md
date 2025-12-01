@@ -65,6 +65,7 @@ User table:
     pin,                            CHAR(4),                                                           The 4-digit PIN for access control.
 
 Password Table:
+
      Column,                 Data Type,                      Constraint,                                             Description
     id,                     INT,                            "PRIMARY KEY, AUTO_INCREMENT",                      Unique password record identifier.
     user_id,                INT,                             "FOREIGN KEY to users.id, ON DELETE CASCADE",      Links the password to its owner.
