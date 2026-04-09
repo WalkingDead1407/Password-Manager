@@ -120,10 +120,10 @@ def verify_otp_for_user(cursor_2fa, username: str, pin_input: str) -> bool:
     totp = pyotp.TOTP(secret_key, digits=4)
 
     if totp.verify(otp_input):
-        print("✅ OTP verified successfully!")
+        print("OTP verified successfully!")
         return True
     else:
-        print("❌ Invalid OTP.")
+        print("Invalid OTP.")
         return False
 
 
@@ -164,6 +164,7 @@ def store_password(cursor, conn):
         )
         conn.commit()
         print("Password stored.")
+        analytics.log_action(user_id, 'CREATE', {'website': website})
     else:
         print("User not found.")
 
@@ -205,6 +206,8 @@ def view_password(cursor, conn):
         print(f"Password for {username} at {website}: {result[0]}")
     else:
         print("No password found.")
+    analytics.log_action(user_id, 'READ', {'website': website})
+
 
 def update_password(cursor, conn):
     username = input("Enter your username: ").strip()
@@ -235,6 +238,7 @@ def update_password(cursor, conn):
         print("Password updated.")
     else:
         print("No matching record.")
+    analytics.log_action(user_id, 'UPDATE', {'website': website})
 
 def delete_password(cursor, conn):
     username = input("Enter your username: ").strip()
@@ -264,7 +268,7 @@ def delete_password(cursor, conn):
         print("Password deleted.")
     else:
         print("No record found.")
-
+    analytics.log_action(user_id, 'DELETE', {'website': website})
 def psc(cursor):
     username = input("Enter your username: ").strip()
 
@@ -307,7 +311,12 @@ def psc(cursor):
     print(f"Entropy: {analysis['entropy']} bits")
     print(f"Strength: {analysis['rating']}")
 
-
+def view_analytics():
+    username = input("Enter username: ")
+    user_data = get_user_by_username(username)
+    if user_data:
+        report = analytics.generate_report(user_data['id'])
+        print(report)
 
 def main():
     conn, cursor = connect_to_database()
